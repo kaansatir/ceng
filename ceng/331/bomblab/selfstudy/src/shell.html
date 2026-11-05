@@ -1,0 +1,399 @@
+<title>Bomb Lab Debugger</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+  /* Layout: full-height app shell — sticky header with bomb tabs, a dominant terminal "screen", a sidebar for sol.txt + gdb reference; stacks to one column on phones. */
+  :root {
+    --bg: #eef0f3; --panel: #ffffff; --panel-2: #f6f7f9; --border: #d7dbe2; --border-2: #e6e9ee;
+    --fg: #1a1f27; --muted: #5c6672; --faint: #8893a1;
+    --accent: #2f6db3; --accent-fg: #ffffff;
+    --good: #1f8a52; --warn: #b26b00; --bad: #c8372d;
+    /* terminal screen — a deliberately fixed dark surface in both themes */
+    --term-bg: #0d1117; --term-fg: #cdd6e2; --term-dim: #8b95a4;
+    --term-ps: #45c46a; --term-cmd: #f0f4fa; --term-hit: #d9a441; --term-err: #ff6a5e; --term-accent: #6cb0ea;
+    --term-sel: rgba(108,176,234,.28);
+    --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: "IBM Plex Sans", system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    --shadow: 0 1px 2px rgba(10,15,25,.06), 0 6px 18px rgba(10,15,25,.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0a0d12; --panel: #121722; --panel-2: #0e131c; --border: #273142; --border-2: #1c2431;
+      --fg: #e7edf5; --muted: #99a3b2; --faint: #6b7686;
+      --accent: #5a9bd8; --accent-fg: #06101d;
+      --good: #4cc98a; --warn: #e0a84a; --bad: #ff6a5e;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0a0d12; --panel: #121722; --panel-2: #0e131c; --border: #273142; --border-2: #1c2431;
+    --fg: #e7edf5; --muted: #99a3b2; --faint: #6b7686;
+    --accent: #5a9bd8; --accent-fg: #06101d;
+    --good: #4cc98a; --warn: #e0a84a; --bad: #ff6a5e;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; }
+  body { background: var(--bg); color: var(--fg); font-family: var(--sans); -webkit-font-smoothing: antialiased; }
+  body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); background: var(--panel); z-index: 30; }
+  * { box-sizing: border-box; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+
+  header {
+    position: sticky; top: env(safe-area-inset-top, 0px); z-index: 20;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 10px max(16px, env(safe-area-inset-right, 0px)) 10px max(16px, env(safe-area-inset-left, 0px));
+  }
+  .brand { display: flex; align-items: baseline; gap: 9px; font-weight: 700; letter-spacing: -.01em; }
+  .brand .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 0 3px color-mix(in srgb, var(--bad) 22%, transparent); align-self: center; }
+  .brand .sub { font-family: var(--mono); font-size: 12px; font-weight: 500; color: var(--muted); letter-spacing: 0; }
+  .tabs { display: flex; gap: 4px; margin-left: 4px; flex-wrap: wrap; }
+  .tab {
+    font-family: var(--mono); font-size: 13px; font-weight: 500; color: var(--muted);
+    background: transparent; border: 1px solid transparent; border-radius: 7px; padding: 5px 11px; cursor: pointer; line-height: 1;
+  }
+  .tab:hover { background: var(--panel-2); color: var(--fg); }
+  .tab[aria-selected="true"] { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
+  .spacer { flex: 1 1 auto; }
+  .ghost {
+    font-family: var(--sans); font-size: 13px; color: var(--muted); background: transparent;
+    border: 1px solid var(--border); border-radius: 7px; padding: 6px 10px; cursor: pointer;
+  }
+  .ghost:hover { color: var(--fg); border-color: var(--faint); }
+
+  main { flex: 1 1 auto; display: grid; grid-template-columns: minmax(0, 1fr) 340px; min-height: 0; }
+  .term-wrap { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--term-bg); }
+  .term {
+    flex: 1 1 auto; overflow: auto; min-height: 0;
+    font-family: var(--mono); font-size: 13px; line-height: 1.5; color: var(--term-fg);
+    tab-size: 8; -moz-tab-size: 8; white-space: pre-wrap; word-break: break-word;
+    padding: 14px 16px 6px;
+  }
+  .term ::selection, .inputline ::selection { background: var(--term-sel); }
+  .term .ps { color: var(--term-ps); }
+  .term .cmd { color: var(--term-cmd); font-weight: 500; }
+  .term .hit { color: var(--term-hit); }
+  .term .err { color: var(--term-err); }
+  .term .dim { color: var(--term-dim); }
+  .inputline {
+    display: flex; align-items: flex-start; gap: 0; background: var(--term-bg);
+    border-top: 1px solid rgba(255,255,255,.05);
+    padding: 8px 16px 10px; font-family: var(--mono); font-size: 13px; line-height: 1.5;
+  }
+  .inputline .ps { color: var(--term-ps); white-space: pre; }
+  .inputline.reading .ps { color: var(--term-hit); }
+  #cmd {
+    flex: 1 1 auto; min-width: 0; background: transparent; border: none; outline: none;
+    color: var(--term-cmd); font-family: var(--mono); font-size: 13px; line-height: 1.5; padding: 0;
+    caret-color: var(--term-ps);
+  }
+  #cmd::placeholder { color: var(--term-dim); }
+  .termbar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    background: var(--term-bg); border-top: 1px solid rgba(255,255,255,.06);
+    padding: 7px max(10px, env(safe-area-inset-left, 0px)) max(7px, env(safe-area-inset-bottom, 0px)) 16px;
+  }
+  .termbar .tbtn {
+    font-family: var(--mono); font-size: 12px; color: var(--term-dim); background: rgba(255,255,255,.04);
+    border: 1px solid rgba(255,255,255,.08); border-radius: 6px; padding: 4px 9px; cursor: pointer;
+  }
+  .termbar .tbtn:hover { color: var(--term-fg); border-color: rgba(255,255,255,.18); }
+  .termbar .status { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--term-dim); display: flex; align-items: center; gap: 6px; }
+  .termbar .status .led { width: 7px; height: 7px; border-radius: 50%; background: var(--term-dim); }
+  .status.run .led { background: var(--term-ps); box-shadow: 0 0 0 3px color-mix(in srgb, var(--term-ps) 25%, transparent); }
+  .status.read .led { background: var(--term-hit); box-shadow: 0 0 0 3px color-mix(in srgb, var(--term-hit) 25%, transparent); }
+  .status.dead .led { background: var(--term-err); }
+
+  aside.side {
+    border-left: 1px solid var(--border); background: var(--panel); min-width: 0;
+    display: flex; flex-direction: column; overflow: auto;
+    padding: 14px max(16px, env(safe-area-inset-right, 0px)) max(16px, env(safe-area-inset-bottom, 0px)) 14px; gap: 14px;
+  }
+  .panel { border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2); overflow: hidden; }
+  .panel > h2 {
+    margin: 0; font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase;
+    color: var(--muted); padding: 10px 12px; border-bottom: 1px solid var(--border-2); display: flex; align-items: center; gap: 8px;
+  }
+  .panel > h2 .hint { font-weight: 400; letter-spacing: 0; text-transform: none; color: var(--faint); font-size: 11px; }
+  .sol .body { padding: 10px 12px; display: flex; flex-direction: column; gap: 9px; }
+  #sol {
+    width: 100%; min-height: 128px; resize: vertical; background: var(--term-bg); color: var(--term-fg);
+    border: 1px solid var(--border); border-radius: 7px; padding: 9px 10px;
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.5; tab-size: 8; outline: none;
+  }
+  #sol:focus { border-color: var(--accent); }
+  .sol .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .btn {
+    font-family: var(--sans); font-size: 13px; font-weight: 600; color: var(--accent-fg); background: var(--accent);
+    border: none; border-radius: 7px; padding: 7px 13px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+  }
+  .btn:hover { filter: brightness(1.06); }
+  .btn.sec { color: var(--fg); background: transparent; border: 1px solid var(--border); font-weight: 500; }
+  .btn.sec:hover { border-color: var(--faint); }
+  .saved { font-family: var(--mono); font-size: 11px; color: var(--good); opacity: 0; transition: opacity .2s; }
+  .saved.show { opacity: 1; }
+
+  .ref .body { padding: 4px 0 6px; }
+  .ref details { border-bottom: 1px solid var(--border-2); }
+  .ref details:last-child { border-bottom: none; }
+  .ref summary { cursor: pointer; padding: 8px 12px; font-size: 12.5px; font-weight: 600; color: var(--fg); list-style: none; display: flex; align-items: center; gap: 7px; }
+  .ref summary::-webkit-details-marker { display: none; }
+  .ref summary::before { content: "▸"; color: var(--faint); font-size: 10px; }
+  .ref details[open] summary::before { content: "▾"; }
+  .ref .rows { padding: 2px 12px 10px; display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; align-items: baseline; }
+  .ref code { font-family: var(--mono); font-size: 12px; color: var(--accent); white-space: nowrap; }
+  .ref .d { font-size: 12px; color: var(--muted); line-height: 1.45; }
+  .ref .note { padding: 9px 12px; font-size: 12px; color: var(--muted); line-height: 1.5; }
+  .ref .note b { color: var(--fg); font-weight: 600; }
+
+  @media (max-width: 880px) {
+    #app { height: auto; min-height: 100%; }
+    main { grid-template-columns: 1fr; }
+    .term-wrap { height: 62vh; min-height: 340px; }
+    aside.side { border-left: none; border-top: 1px solid var(--border); overflow: visible; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div id="app">
+  <header>
+    <div class="brand"><span class="dot"></span>Bomb Lab<span class="sub">gdb · x86-64</span></div>
+    <div class="tabs" id="tabs" role="tablist" aria-label="Choose a bomb"></div>
+    <span class="spacer"></span>
+    <button class="ghost" id="theme" title="Toggle light / dark">◐ theme</button>
+  </header>
+  <main>
+    <section class="term-wrap">
+      <div class="term" id="term" tabindex="0" aria-label="gdb terminal"></div>
+      <div class="inputline" id="inputline">
+        <span class="ps" id="ps">(gdb) </span>
+        <input id="cmd" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="gdb command" placeholder="break phase_1 · run · si · info registers …">
+      </div>
+      <div class="termbar">
+        <button class="tbtn" id="restart" title="Start a fresh gdb session on this bomb">⟲ restart gdb</button>
+        <button class="tbtn" id="clear" title="Clear the screen (Ctrl-L) — keeps the session">clear</button>
+        <button class="tbtn" id="copy" title="Copy everything on screen">copy</button>
+        <span class="status" id="status"><span class="led"></span><span id="statustext">not started</span></span>
+      </div>
+    </section>
+    <aside class="side">
+      <div class="panel sol">
+        <h2>sol.txt <span class="hint">your answers file · <code style="color:var(--accent)">run sol.txt</code></span></h2>
+        <div class="body">
+          <textarea id="sol" spellcheck="false" placeholder="One line per phase, in order.&#10;As you defuse a phase, paste its line here&#10;and use  run sol.txt  to replay them all."></textarea>
+          <div class="row">
+            <button class="btn" id="runsol">▶ run sol.txt</button>
+            <button class="btn sec" id="clrsol">clear</button>
+            <span class="saved" id="savedmsg">saved</span>
+          </div>
+        </div>
+      </div>
+      <div class="panel ref">
+        <h2>field notes</h2>
+        <div class="body" id="refbody"></div>
+      </div>
+    </aside>
+  </main>
+</div>
+
+<script>/*__EMU__*/</script>
+<script>/*__GDB__*/</script>
+<script>window.BOMBS=/*__DATA__*/null;window.BOMBSRCS=/*__SRC__*/null;</script>
+<script>
+(function () {
+  "use strict";
+  var GDBVER = "GNU gdb (Ubuntu 15.1-1ubuntu1~24.04.1) 15.1";
+  var BOMBS = window.BOMBS || {}, SRCS = window.BOMBSRCS || {};
+  var ids = Object.keys(BOMBS).map(Number).sort(function (a, b) { return a - b; });
+  var sessions = {}, cur = null;
+  var term = document.getElementById("term"), cmdEl = document.getElementById("cmd"),
+      psEl = document.getElementById("ps"), inputline = document.getElementById("inputline"),
+      statusEl = document.getElementById("status"), statusText = document.getElementById("statustext");
+
+  function ls(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; } }
+  function classify(line) {
+    if (/^(BOOM!!!|The bomb has blown up\.|Program received signal|Program terminated with signal|Cannot access memory|Warning:|Cannot insert breakpoint|Command aborted\.|\*\*\* stack smashing)/.test(line)) return "err";
+    if (/exited with code 0[0-7]+\]$/.test(line)) return "err";
+    if (/^(Breakpoint|Temporary breakpoint) \d+, /.test(line) || /^(Hardware watchpoint|Watchpoint) \d+: /.test(line)) return "hit";
+    if (/^\[simulator/.test(line)) return "dim";
+    return null;
+  }
+  function appendOut(text) {
+    if (!text) return;
+    var parts = String(text).split("\n"), frag = document.createDocumentFragment();
+    for (var i = 0; i < parts.length; i++) {
+      var seg = parts[i];
+      if (i > 0) frag.appendChild(document.createTextNode("\n"));
+      if (seg === "") continue;
+      var cls = classify(seg);
+      if (cls) { var sp = document.createElement("span"); sp.className = cls; sp.textContent = seg; frag.appendChild(sp); }
+      else frag.appendChild(document.createTextNode(seg));
+    }
+    term.appendChild(frag);
+    term.scrollTop = term.scrollHeight;
+  }
+  function span(text, cls) { var sp = document.createElement("span"); sp.className = cls; sp.textContent = text; term.appendChild(sp); term.scrollTop = term.scrollHeight; }
+  function echoPrompt(text) { span("(gdb) ", "ps"); if (text) span(text, "cmd"); }
+  function mode(g) { return g.question ? "q" : g.waiting ? "w" : "p"; }
+  function setStatus(cls, txt) { statusEl.className = "status" + (cls ? " " + cls : ""); statusText.textContent = txt; }
+  function refreshPrompt() {
+    var g = sessions[cur].gdb, m = mode(g);
+    if (m === "q") { psEl.textContent = ""; inputline.classList.add("reading"); cmdEl.placeholder = "answer y or n, then Enter"; setStatus("read", "waiting for y / n"); }
+    else if (m === "w") { psEl.textContent = ""; inputline.classList.add("reading"); cmdEl.placeholder = "the bomb is reading a line: type input, press Enter (Ctrl-C interrupts)"; setStatus("read", "reading stdin"); }
+    else {
+      psEl.textContent = "(gdb) "; inputline.classList.remove("reading"); cmdEl.placeholder = "break phase_1 · run · si · info registers …";
+      if (g.running) setStatus("run", "stopped"); else if (g.exited) setStatus("dead", "exited"); else setStatus("", g.loaded ? "not running" : "not started");
+    }
+  }
+  function banner(n) { appendOut(GDBVER + "\nReading symbols from " + (BOMBS[n].bin_name || "bomb-quiet") + "...\n"); }
+  function makeSession(n) {
+    var sol = ls("bomb_sol_" + n);
+    var files = { "sol.txt": sol == null ? "" : sol };
+    var src = (SRCS[BOMBS[n].src_id] || "").split("\n");
+    return { gdb: new window.GDB(BOMBS[n], { out: appendOut, src: src, files: files }), hist: [], hpos: 0, files: files };
+  }
+  function selectBomb(n) {
+    if (cur === n) return;
+    if (cur != null) sessions[cur].html = term.innerHTML;
+    cur = n;
+    document.querySelectorAll(".tab").forEach(function (t) { t.setAttribute("aria-selected", String(+t.dataset.n === n)); });
+    if (!sessions[n]) { sessions[n] = makeSession(n); term.innerHTML = ""; banner(n); }
+    else term.innerHTML = sessions[n].html || "";
+    var sol = ls("bomb_sol_" + n); document.getElementById("sol").value = sol == null ? "" : sol;
+    refreshPrompt(); term.scrollTop = term.scrollHeight; cmdEl.focus();
+  }
+  function afterCommand() {
+    var s = sessions[cur];
+    if (s.gdb.quitting) {
+      span("[gdb exited; starting a fresh gdb session]\n", "dim");
+      var hist = s.hist; sessions[cur] = makeSession(cur); sessions[cur].hist = hist; sessions[cur].hpos = hist.length; banner(cur);
+    }
+    refreshPrompt(); term.scrollTop = term.scrollHeight;
+  }
+  function run(fn) { try { fn(); } catch (e) { appendOut("[simulator error: " + (e && e.message) + "]\n"); if (window.console) console.error(e); } afterCommand(); }
+  function submit(line) {
+    var s = sessions[cur], g = s.gdb, m = mode(g);
+    if (m === "p") { echoPrompt(line); span("\n", "cmd"); } else span(line + "\n", "cmd");
+    if (line.trim() !== "" && s.hist[s.hist.length - 1] !== line) { s.hist.push(line); if (s.hist.length > 400) s.hist.shift(); }
+    s.hpos = s.hist.length;
+    run(function () { if (m === "w") g.feedStdin(line); else g.exec(line); });
+  }
+
+  cmdEl.addEventListener("keydown", function (e) {
+    var s = sessions[cur], g = s.gdb, k = e.key;
+    if (k === "Enter") { e.preventDefault(); var v = cmdEl.value; cmdEl.value = ""; submit(v); return; }
+    if (k === "ArrowUp") { e.preventDefault(); if (s.hpos > 0) { s.hpos--; cmdEl.value = s.hist[s.hpos] || ""; var L = cmdEl.value.length; setTimeout(function () { cmdEl.setSelectionRange(L, L); }, 0); } return; }
+    if (k === "ArrowDown") { e.preventDefault(); if (s.hpos < s.hist.length) { s.hpos++; cmdEl.value = s.hist[s.hpos] || ""; } return; }
+    if (e.ctrlKey && !e.metaKey && !e.altKey && (k === "c" || k === "C")) {
+      var sel = window.getSelection ? String(window.getSelection()) : "";
+      if (sel || cmdEl.selectionStart !== cmdEl.selectionEnd) return;
+      e.preventDefault();
+      var txt = cmdEl.value; cmdEl.value = "";
+      if (mode(g) === "p") echoPrompt(txt); else if (txt) span(txt, "cmd");
+      run(function () { g.interrupt(); });
+      return;
+    }
+    if (e.ctrlKey && !e.metaKey && (k === "d" || k === "D")) {
+      if (cmdEl.value) return;
+      e.preventDefault();
+      if (mode(g) === "p") echoPrompt("");
+      run(function () { g.ctrlD(); });
+      return;
+    }
+    if (e.ctrlKey && (k === "l" || k === "L")) { e.preventDefault(); term.innerHTML = ""; }
+  });
+  term.addEventListener("mouseup", function () { if (!String(window.getSelection())) cmdEl.focus(); });
+
+  document.getElementById("restart").addEventListener("click", function () {
+    var hist = sessions[cur].hist; sessions[cur] = makeSession(cur); sessions[cur].hist = hist; sessions[cur].hpos = hist.length;
+    term.innerHTML = ""; banner(cur); refreshPrompt(); cmdEl.focus();
+  });
+  document.getElementById("clear").addEventListener("click", function () { term.innerHTML = ""; cmdEl.focus(); });
+  document.getElementById("copy").addEventListener("click", function () {
+    var txt = term.innerText, btn = this;
+    function sel() { var r = document.createRange(); r.selectNodeContents(term); var s2 = window.getSelection(); s2.removeAllRanges(); s2.addRange(r); }
+    function done(ok) { btn.textContent = ok ? "copied ✓" : "selected, press ⌘C"; setTimeout(function () { btn.textContent = "copy"; }, 1600); }
+    try { navigator.clipboard.writeText(txt).then(function () { done(true); }, function () { sel(); done(false); }); } catch (e) { sel(); done(false); }
+  });
+
+  var solEl = document.getElementById("sol"), savedMsg = document.getElementById("savedmsg"), saveT;
+  solEl.addEventListener("input", function () {
+    if (cur == null) return;
+    ls("bomb_sol_" + cur, solEl.value);
+    if (sessions[cur]) sessions[cur].files["sol.txt"] = solEl.value;
+    clearTimeout(saveT); savedMsg.classList.add("show"); saveT = setTimeout(function () { savedMsg.classList.remove("show"); }, 900);
+  });
+  document.getElementById("runsol").addEventListener("click", function () {
+    var g = sessions[cur].gdb;
+    sessions[cur].files["sol.txt"] = solEl.value;
+    cmdEl.focus();
+    if (mode(g) !== "p") { cmdEl.placeholder = "finish the current input first, or press Ctrl-C"; return; }
+    submit("run sol.txt");
+  });
+  document.getElementById("clrsol").addEventListener("click", function () { solEl.value = ""; ls("bomb_sol_" + cur, ""); if (sessions[cur]) sessions[cur].files["sol.txt"] = ""; });
+
+  var themeBtn = document.getElementById("theme");
+  (function () { var t = ls("bomb_theme"); if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t); })();
+  themeBtn.addEventListener("click", function () {
+    var cs = document.documentElement.getAttribute("data-theme");
+    var dark = cs ? cs === "dark" : window.matchMedia("(prefers-color-scheme: dark)").matches;
+    var nx = dark ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", nx); ls("bomb_theme", nx);
+  });
+
+  var tabs = document.getElementById("tabs");
+  ids.forEach(function (n) {
+    var b = document.createElement("button"); b.className = "tab"; b.dataset.n = n; b.textContent = "bomb " + n;
+    b.setAttribute("role", "tab"); b.setAttribute("aria-selected", "false");
+    b.addEventListener("click", function () { selectBomb(n); });
+    tabs.appendChild(b);
+  });
+
+  function c(x) { return '<code>' + x + '</code>'; }
+  function row(x, d) { return c(x) + '<span class="d">' + d + '</span>'; }
+  document.getElementById("refbody").innerHTML = [
+    '<details open><summary>Start here</summary><div class="rows">',
+    row("break phase_2", "stop when the phase begins"),
+    row("run", "start; the bomb then reads your input"),
+    row("si &nbsp;/&nbsp; ni", "one instruction: into / over calls"),
+    row("display/i $pc", "show the next instruction at every stop"),
+    row("info registers", "all registers (i r rdi for one)"),
+    row("continue", "run until the next breakpoint"),
+    '</div></details>',
+    '<details><summary>Look around</summary><div class="rows">',
+    row("disas phase_2", "disassemble a function"),
+    row("x/8xw $rsp", "8 words of memory, hex"),
+    row("x/6dw $rsp", "the same as signed ints"),
+    row("x/s $rdi", "memory as a C string"),
+    row("p/x $rsi", "a register in hex"),
+    row("p *(int*)($rsp+8)", "the int stored at rsp+8"),
+    row("bt &nbsp;/&nbsp; up &nbsp;/&nbsp; down", "who called whom"),
+    row("finish", "run to the end of this function"),
+    '</div></details>',
+    '<details><summary>Addresses: offsets vs. real</summary><div class="note">',
+    'Before the first ' + c('run') + ', gdb shows <b>file offsets</b> like ' + c('0x2aac') + ' (the bomb is position-independent and not loaded yet), and ' + c('x/s 0x2aac') + ' reads the file. ',
+    'After ' + c('run'), ' it switches to <b>real addresses</b> (here ' + c('0x555555400000') + ' + offset) and keeps them even after the bomb exits; the bare offset then fails. ',
+    'The robust move: ' + c('disas') + ' again after ' + c('run') + ', or stop right after the ' + c('lea') + ' and read the register it filled: ' + c('x/s $rsi') + '.',
+    '</div></details>',
+    '<details><summary>Breakpoints</summary><div class="rows">',
+    row("break *phase_2+40", "an offset into a function"),
+    row("break *0x555555401f40", "an exact address (needs the *)"),
+    row("break phase_6 if $rdi != 0", "only when a condition holds"),
+    row("info break", "list them"),
+    row("delete 2 / disable 2", "remove / turn off"),
+    '</div><div class="note"><b>Two classic errors.</b> ' + c('break 0x1f40') + ' (no ' + c('*') + ') gives <i>Function "0x1f40" not defined</i>. ' + c('break *0x1f40') + ' before ' + c('run') + ' gives <i>Cannot insert breakpoint</i> at run time; use ' + c('break *phase_2+N') + ' instead.</div></details>',
+    '<details><summary>Keys</summary><div class="rows">',
+    row("Enter", "repeat the last command (x continues)"),
+    row("↑ / ↓", "command history"),
+    row("Ctrl-C", "interrupt while the bomb waits for input"),
+    row("Ctrl-D", "end of input / quit"),
+    '</div></details>',
+    '<div class="note">These are your real practice bombs, running in an x86-64 simulator checked instruction by instruction against real gdb. Explosions are free here, so experiment and work out which questions to ask. Nothing is sent anywhere.</div>'
+  ].join("");
+
+  if (ids.length) selectBomb(ids[0]);
+  cmdEl.focus();
+})();
+</script>
