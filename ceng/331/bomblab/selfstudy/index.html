@@ -1,3 +1,4 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
 <title>Bomb Lab Debugger</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -992,6 +993,7 @@
   GDB.prototype.reset = function () {
     this.emu = new Emu(this.data, { out: this.out, files: this.files, progName: this.progPath });
     this.running = false; this.waiting = false; this.inRead = false; this.pend = null; this.sigPending = null; this.selFrame = 0;
+    this.dummies = [];
   };
 
   /* ---------------- address spaces ---------------- */
@@ -1080,6 +1082,8 @@
     return null;
   };
   GDB.prototype.labelU = function (A) { return this.labelRt(this.toRt(A)); };
+  /* print demangles: a static like array.3437 shows as <array> (x and disas keep the raw name) */
+  GDB.prototype.labelP = function (A) { var l = this.labelU(A); return l ? l.replace(/^<([A-Za-z_][A-Za-z0-9_]*)\.\d+(?=[+>])/, "<$1") : l; };
   GDB.prototype.rebase = function (text) {
     if (this.loaded || this.delta === 0n) return text;
     var b = this.base, e = this.base + this.span, d = this.delta;
@@ -1115,6 +1119,15 @@
     else fr.push({ pc: emu.R.rip, sh: sh.length - 1 });
     if (this.funcAt(fr[0].pc) && this.funcAt(fr[0].pc).name === 'main') return fr;
     for (var i = sh.length - 1; i >= 1; i--) {
+      if (sh[i].dummy) {
+        /* a function called from gdb: show the dummy frame, then where the program was stopped */
+        var dm = sh[i].dummy, ipc = dm.R.rip;
+        fr.push({ dummyFrame: true, pc: sh[i].ret, sh: i - 1 });
+        fr.push(dm.lib && !this.inText(ipc) ? { pc: ipc, lib: dm.lib.name, sh: i - 1 } : { pc: ipc, sh: i - 1 });
+        var f0 = this.funcAt(ipc);
+        if (f0 && f0.name === 'main') break;
+        continue;
+      }
       fr.push({ pc: sh[i].ret, outer: true, sh: i - 1 });
       var f = this.funcAt(sh[i].ret);
       if (f && f.name === 'main') break;
@@ -1123,6 +1136,7 @@
   };
   GDB.prototype.cfa = function (fr) { var e = this.emu.shadow[fr.sh !== undefined ? fr.sh : this.emu.shadow.length - 1]; return e ? e.sp + 8n : this.emu.R.rsp; };
   GDB.prototype.frameHead = function (idx, f) {
+    if (f.dummyFrame) return '<function called from gdb>';
     if (f.lib) return hx(f.pc, 16) + ' in ' + f.lib + ' () from ' + LIBC;
     var fn = this.funcAt(f.pc);
     if (fn && fn.name === 'main') {
@@ -1203,18 +1217,52 @@
     }
     if (c === '(') {
       var cl = this.matchParen(this.i);
-      if (cl > 0) { var ty2 = parseType(this.s.slice(this.i + 1, cl)); if (ty2) { this.i = cl + 1; return g.cast(this.unary(), ty2); } }
+      if (cl > 0) {
+        var ty2 = parseType(this.s.slice(this.i + 1, cl));
+        if (ty2) {
+          /* gdb passes the cast type down to a function call as its return type: (int)func4(6), (int)(func4(6)) */
+          this.i = cl + 1; this.ws();
+          var at = this.i; while (this.s[at] === '(') { at++; while (at < this.s.length && /\s/.test(this.s[at])) at++; }
+          var savedHint = this.castFor; this.castFor = { ty: ty2, at: at };
+          var opnd = this.unary(); this.castFor = savedHint;
+          if (opnd && opnd.fromCall === ty2) return opnd;
+          return g.cast(opnd, ty2);
+        }
+      }
     }
     return this.postfix();
   };
   Parser.prototype.postfix = function () {
-    var x = this.primary();
+    this.ws();
+    var start = this.i, x = this.primary();
     for (; ;) {
       this.ws();
       if (this.s[this.i] === '[') { this.i++; var idx = this.expr(); this.ws(); if (this.s[this.i] !== ']') this.syntax(); this.i++; x = this.g.deref(this.g.binop('+', x, idx)); continue; }
-      if (this.s[this.i] === '(' && (x.func || x.t === 'textptr')) throw GErr('[simulator: calling functions inside the program is not supported]');
+      if (this.s[this.i] === '(' && (x.func || x.t === 'textptr')) {
+        this.i++; var args = [];
+        this.ws();
+        if (this.s[this.i] === ')') this.i++;
+        else for (; ;) {
+          this.ws();
+          args.push(this.s[this.i] === '"' ? this.strLit() : this.bin(0));
+          this.ws();
+          if (this.s[this.i] === ',') { this.i++; continue; }
+          if (this.s[this.i] === ')') { this.i++; break; }
+          this.syntax();
+        }
+        var rt = this.castFor && this.castFor.at === start ? this.castFor.ty : undefined;
+        x = this.g.infcall(x, args, rt);
+        continue;
+      }
       return x;
     }
+  };
+  Parser.prototype.strLit = function () {
+    var m = /^"((?:\\.|[^"\\])*)"/.exec(this.s.slice(this.i));
+    if (!m) throw GErr('Unterminated string in expression.');
+    this.i += m[0].length;
+    var E = { n: '\n', t: '\t', r: '\r', a: '\x07', b: '\b', f: '\f', v: '\v', e: '\x1b', '0': '\0' };
+    return { strlit: m[1].replace(/\\([0-7]{1,3}|.)/g, function (q, c) { if (/^[0-7]+$/.test(c)) return String.fromCharCode(parseInt(c, 8)); return E[c] !== undefined ? E[c] : c; }) };
   };
   Parser.prototype.primary = function () {
     this.ws(); var c = this.s[this.i], rest = this.s.slice(this.i), g = this.g, m;
@@ -1250,7 +1298,8 @@
       else t = 'unsigned long';
       return mk(v, t);
     }
-    m = /^[A-Za-z_][A-Za-z0-9_.]*/.exec(rest);
+    /* a dot ends the name, as in real gdb: array.0 reads as "array" (quote it: 'array.0') */
+    m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(rest);
     if (m) { this.i += m[0].length; return g.symVal(m[0]); }
     this.syntax();
   };
@@ -1282,7 +1331,69 @@
     if (this.loaded && this.libcAddr[name] !== undefined) return { func: true, v: this.libcAddr[name], t: 'func', name: name };
     throw GErr('No symbol "' + name + '" in current context.');
   };
-  GDB.prototype.nodebugErr = function (x) { return GErr("'" + x.name + "' has unknown type; cast it to its declared type"); };
+  GDB.prototype.nodebugErr = function (x) { return GErr("'" + String(x.name).replace(/\.\d+$/, '') + "' has unknown type; cast it to its declared type"); };
+
+  /* ---------------- calling a function of the program (p (int)func4(6)) ---------------- */
+  var CALL_TAIL = '\nEvaluation of the expression containing the function\n(';
+  GDB.prototype.infcall = function (fnv, args, rt) {
+    if (!this.running) throw GErr("You can't do that without a process to debug.");
+    var emu = this.emu, R = emu.R, addr = BigInt.asUintN(64, fnv.v), fobj = this.funcAt(addr);
+    var name = fnv.name ? String(fnv.name).replace(/@plt$/, '') : (fobj ? fobj.name : null);
+    if (rt === undefined) throw GErr("'" + (name || hx(addr)) + "' has unknown return type; cast the call to its declared return type");
+    if (this.inCond) throw GErr('[simulator: calling functions in a breakpoint condition is not supported]');
+    if (this.inDisplay) throw GErr('[simulator: calling functions in a display expression is not supported]');
+    if (args.length > 6) throw GErr('[simulator: calls with more than 6 arguments are not supported]');
+    var self = this, vals = args.map(function (a) {
+      if (a.strlit !== undefined) { var p = emu.alloc(a.strlit.length + 1); emu.wstr(p, a.strlit, true); return p; }
+      a = self.rv(a);
+      if (a.voidc) throw GErr('Invalid cast.');
+      if (isPtr(a.t) || a.t === 'textptr' || a.t === 'codefn') return BigInt.asUintN(64, a.v);
+      var t = promote(a.t); return BigInt.asUintN(tsize(t) * 8, sv(a));
+    });
+    var label = name || hx(addr);
+    var rec = { R: Object.assign({}, R), shadow: emu.shadow.slice(), lib: emu.lib ? Object.assign({}, emu.lib) : null, inRead: this.inRead, selFrame: this.selFrame, name: label, sigPending: this.sigPending };
+    this.sigPending = null; /* the call starts without the last stop's signal; it comes back when the call is popped */
+    /* a fresh frame below the red zone; the return address points into the stack (as gdb's does) and is never executed */
+    var A = BigInt.asUintN(64, (R.rsp - 0x80n - 0x10n) & ~0xfn);
+    rec.ret = A + 0xfn;
+    emu.write(A - 8n, 8, rec.ret);
+    R.rsp = A - 8n;
+    emu.shadow.push({ ret: rec.ret, sp: R.rsp, dummy: rec });
+    ['rdi', 'rsi', 'rdx', 'rcx', 'r8', 'r9'].forEach(function (r, i) { if (i < vals.length) R[r] = vals[i]; });
+    R.rax = 0n;
+    emu.lib = null;
+    if (!this.inText(addr) && !this.pltAt(addr) && name && this.libcAddr[name] !== undefined) emu.lib = { name: name, steps: 0, entry: addr };
+    R.rip = addr;
+    this.dummies.push(rec);
+    this.inRead = false; this.selFrame = 0;
+    var r = this.loop({ si: true }, null, false);
+    if (r.dummyDone) {
+      if (rt === 'void') return { voidc: true, fromCall: 'void' };
+      var v = mk(r.rax, rt); v.fromCall = rt; return v;
+    }
+    if (r.block) {
+      /* the function wants to read input: undo the call */
+      this.dummies.pop();
+      for (var k in rec.R) R[k] = rec.R[k];
+      emu.shadow = rec.shadow; emu.lib = rec.lib; this.inRead = rec.inRead; this.selFrame = rec.selFrame; this.sigPending = rec.sigPending;
+      throw GErr('[simulator: ' + label + '() reads input, which a call from gdb cannot do here]');
+    }
+    if (r.exit !== undefined) {
+      this.endExit(r.exit);
+      throw GErr('The program being debugged exited while in a function called from GDB.' + CALL_TAIL + label + ') will be abandoned.');
+    }
+    this.report(r);
+    if (r.signal || r.runaway)
+      throw GErr('The program being debugged was signaled while in a function called from GDB.\nGDB remains in the frame where the signal was received.\nTo change this behavior use "set unwind-on-signal on".' + CALL_TAIL + label + ') will be abandoned.\nWhen the function is done executing, GDB will silently stop.');
+    throw GErr('The program being debugged stopped while in a function called from GDB.' + CALL_TAIL + label + ') will be abandoned.\nWhen the function is done executing, GDB will silently stop.');
+  };
+  /* the called function returned into its dummy frame: restore the program as it was before the call */
+  GDB.prototype.popDummy = function () {
+    var d = this.dummies.pop(), emu = this.emu, rax = emu.R.rax;
+    for (var k in d.R) emu.R[k] = d.R[k];
+    emu.shadow = d.shadow; emu.lib = d.lib; this.inRead = d.inRead; this.selFrame = d.selFrame || 0; this.sigPending = d.sigPending;
+    return { done: true, dummyDone: true, rax: rax };
+  };
   GDB.prototype.rv = function (x) {
     if (x.nodebug) throw this.nodebugErr(x);
     if (x.optimized) throw GErr('value has been optimized out');
@@ -1413,19 +1524,19 @@
     var f = fmt ? fmt.replace(/[0-9bhwg]/g, '') : '';
     if (x.func) {
       if (f && f !== 'a') return this.fmtNum(x.v, 'unsigned long', f);
-      var lb = this.labelU(x.v); return '{<text variable, no debug info>} ' + hx(x.v) + (lb ? ' ' + lb : '');
+      var lb = this.labelP(x.v); return '{<text variable, no debug info>} ' + hx(x.v) + (lb ? ' ' + lb : '');
     }
-    if (x.codefn) { var lc = this.labelU(x.v); return '{void ()} ' + hx(x.v) + (lc ? ' ' + lc : ''); }
+    if (x.codefn) { var lc = this.labelP(x.v); return '{void ()} ' + hx(x.v) + (lc ? ' ' + lc : ''); }
     if (f && f !== 's') return this.fmtNum(x.v, x.t, f);
     var t = x.t;
     if (t === 'eflags') return this.flagStr(x.v);
-    if (t === 'code *') { var l1 = this.labelU(x.v); return '(void (*)()) ' + hx(x.v) + (l1 ? ' ' + l1 : ''); }
-    if (t === 'textptr') { var l2 = this.labelU(x.v); return '(<text variable, no debug info> *) ' + hx(x.v) + (l2 ? ' ' + l2 : ''); }
-    if (t === 'nodebug *') { var l3 = this.labelU(x.v); return '(<data variable, no debug info> *) ' + hx(x.v) + (l3 ? ' ' + l3 : ''); }
+    if (t === 'code *') { var l1 = this.labelP(x.v); return '(void (*)()) ' + hx(x.v) + (l1 ? ' ' + l1 : ''); }
+    if (t === 'textptr') { var l2 = this.labelP(x.v); return '(<text variable, no debug info> *) ' + hx(x.v) + (l2 ? ' ' + l2 : ''); }
+    if (t === 'nodebug *') { var l3 = this.labelP(x.v); return '(<data variable, no debug info> *) ' + hx(x.v) + (l3 ? ' ' + l3 : ''); }
     if (isPtr(t)) {
       var pt = pointee(t);
       if (pt === 'char' || pt === 'unsigned char' || pt === 'signed char') return hx(x.v) + ' ' + this.strAt(x.v);
-      var l4 = this.labelU(x.v); return '(' + t + ') ' + hx(x.v) + (l4 ? ' ' + l4 : '');
+      var l4 = this.labelP(x.v); return '(' + t + ') ' + hx(x.v) + (l4 ? ' ' + l4 : '');
     }
     if (t === 'char' || t === 'signed char' || t === 'unsigned char') { var cv = sv(x); return cv + " '" + chRep(Number(BigInt.asUintN(8, x.v)), "'") + "'"; }
     return sv(x).toString();
@@ -1440,7 +1551,7 @@
       case 'o': return u === 0n ? '0' : '0' + u.toString(8);
       case 't': return u.toString(2);
       case 'c': { var c = Number(BigInt.asUintN(8, v)); return BigInt.asIntN(8, v).toString() + " '" + chRep(c, "'") + "'"; }
-      case 'a': { var lb = this.labelU(u); return hx(u) + (lb ? ' ' + lb : ''); }
+      case 'a': { var lb = this.labelP(u); return hx(u) + (lb ? ' ' + lb : ''); }
       case 'f': return (size === 4 || size === 8) && !/char|short/.test(t) ? (t === 'int' || t === 'long' || /unsigned|\*/.test(t) ? s.toString() : asFloat(v, size)) : s.toString();
       case 'i': throw GErr('Format letter "i" is meaningless in "print" command.');
     }
@@ -1564,8 +1675,10 @@
       if (!b.enabled || b.pending || b.watch || b.trap || b.addr !== pc) continue;
       if (b.cond) {
         var ok;
+        this.inCond = true;
         try { var cv = this.evalExpr(b.cond); ok = cv.voidc ? false : (isPtr(cv.t) ? cv.v !== 0n : sv(this.rv(cv)) !== 0n); }
-        catch (e) { b.hits++; return { condErr: b, msg: e.message }; }
+        catch (e) { this.inCond = false; b.hits++; return { condErr: b, msg: e.message }; }
+        this.inCond = false;
         if (!ok) continue;
       }
       b.hits++;
@@ -1700,7 +1813,7 @@
       if (continuing) this.out('Continuing.\n');
       var sig = this.sigPending;
       this.out('\nProgram terminated with signal ' + sig + ', ' + SIGDESC[sig] + '.\nThe program no longer exists.\n');
-      this.running = false; this.exited = true; this.sigPending = null; return true;
+      this.running = false; this.exited = true; this.sigPending = null; this.dummies = []; return true;
     }
     var traps = this.bps.filter(function (b) { return b.enabled && b.trap; }), self = this;
     if (traps.length) {
@@ -1721,6 +1834,7 @@
     var emu = this.emu, first = true, n = 0;
     for (; ;) {
       var pc = emu.R.rip;
+      if (this.dummies.length && pc === this.dummies[this.dummies.length - 1].ret && !emu.lib) return this.popDummy();
       if (!(first && skip)) { var b = this.bpCheck(pc); if (b) return b; }
       if (!first && stop) { var s = stop.call(this, pc); if (s) return s; }
       if (++n > GUARD) return { runaway: true };
@@ -1732,6 +1846,7 @@
   };
   GDB.prototype.report = function (r, done) {
     if (r.exit !== undefined) { this.endExit(r.exit); return; }
+    if (r.dummyDone && !done) { this.afterStop(); return; } /* "GDB will silently stop" */
     if (r.signal) {
       this.sigPending = r.signal;
       if (r.signal === 'SIGABRT') { this.out('\nProgram received signal SIGABRT, Aborted.\n0x00007ffff7c969fc in pthread_kill () from ' + LIBC + '\n'); this.afterStop(); return; }
@@ -1759,7 +1874,7 @@
   };
   GDB.prototype.endExit = function (code) {
     this.out('[Inferior 1 (process ' + this.pid + ') exited ' + (code === 0 ? 'normally' : 'with code ' + (code ? '0' + (code & 0xff).toString(8) : '0')) + ']\n');
-    this.running = false; this.exited = true; this.waiting = false; this.inRead = false; this.pend = null;
+    this.running = false; this.exited = true; this.waiting = false; this.inRead = false; this.pend = null; this.dummies = [];
     this.conv._exitcode = mk(BigInt(code), 'int');
   };
   GDB.prototype.fromRead = function (pre, done) {
@@ -1791,12 +1906,14 @@
     }
   };
   GDB.prototype.cmdFinish = function () {
-    if (this.resumeGuard(false)) return;
+    if (this.notRunning()) return;
     var s = this.selected();
-    if (this.inRead) { this.fromRead('Run till exit from #0  ' + this.frameHead(0, s.fr[0]) + '\n'); return; }
+    if (this.inRead && !this.sigPending) { if (this.resumeGuard(false)) return; this.fromRead('Run till exit from #0  ' + this.frameHead(0, s.fr[0]) + '\n'); return; }
     if (s.idx + 1 >= s.fr.length) { this.out('"finish" not meaningful in the outermost frame.\n'); return; }
     var target = s.f.sh !== undefined ? s.f.sh + 1 : this.emu.shadow.length;
-    this.out('Run till exit from #' + s.idx + '  ' + this.frameHead(s.idx, s.f) + '\n');
+    /* gdb prints this before resuming, so it also shows when a pending signal then ends the program */
+    this.out('Run till exit from #' + s.idx + (s.idx < 10 ? '  ' : ' ') + this.frameHead(s.idx, s.f) + '\n');
+    if (this.resumeGuard(false)) return;
     var self = this;
     this.go({ mode: { si: true }, stop: function () { return self.emu.shadow.length < target ? { done: true } : false; }, skip: true,
       done: function () { this.out(this.where(false)); } });
@@ -1872,7 +1989,7 @@
     this.ask('Kill the program being debugged? (y or n) ', 'yn', function (yes) {
       if (!yes) { this.out('Not confirmed.\n'); return; }
       this.out('[Inferior 1 (process ' + this.pid + ') killed]\n');
-      this.running = false; this.exited = false; this.waiting = false; this.inRead = false; this.pend = null; this.sigPending = null;
+      this.running = false; this.exited = false; this.waiting = false; this.inRead = false; this.pend = null; this.sigPending = null; this.dummies = [];
     });
   };
   GDB.prototype.feedStdin = function (line) {
@@ -1904,7 +2021,7 @@
     if (!this.running) { this.out('No stack.\n'); return; }
     var fr = this.frames(), n = parseInt((arg || '').replace(/full/, '').trim(), 10), lo = 0, hi = fr.length;
     if (n > 0) hi = Math.min(n, fr.length); else if (n < 0) lo = Math.max(0, fr.length + n);
-    for (var i = lo; i < hi; i++) this.out('#' + i + '  ' + this.frameHead(i, fr[i]) + '\n');
+    for (var i = lo; i < hi; i++) this.out('#' + i + (i < 10 ? '  ' : ' ') + this.frameHead(i, fr[i]) + '\n');
     if (hi < fr.length) this.out('(More stack frames follow...)\n');
   };
   GDB.prototype.cmdFrame = function (kind, arg) {
@@ -1914,7 +2031,7 @@
     else if (kind === 'down') { n = isNaN(n) ? 1 : n; if (this.selFrame - n < 0) { if (this.selFrame === 0) { this.out('Bottom (innermost) frame selected; you cannot go down.\n'); return; } this.selFrame = 0; } else this.selFrame -= n; }
     else if (!isNaN(n)) { if (n >= fr.length || n < 0) { this.out('No frame at level ' + arg.trim() + '.\n'); return; } this.selFrame = n; }
     var f = fr[this.selFrame];
-    this.out('#' + this.selFrame + '  ' + this.frameHead(this.selFrame, f) + '\n' + this.frameSrc(f));
+    this.out('#' + this.selFrame + (this.selFrame < 10 ? '  ' : ' ') + this.frameHead(this.selFrame, f) + '\n' + this.frameSrc(f));
     this.noteListPos();
   };
   GDB.prototype.cmdInfoFrame = function () {
@@ -1969,7 +2086,7 @@
     this.mwrite(lv.lval.addr, sz, nv);
     return { v: nv, t: lv.t, lval: lv.lval };
   };
-  GDB.prototype.cmdPrint = function (arg, quiet) {
+  GDB.prototype.cmdPrint = function (arg, quiet, isCall) {
     var fmt = null, m = /^\/(\w+)\s*/.exec(arg || ''); if (m) { fmt = m[1]; arg = arg.slice(m[0].length); }
     arg = (arg || '').trim();
     try {
@@ -1978,6 +2095,7 @@
       if (!arg) { v = this.histVal(''); if (!this.valHist.length) { this.out('$1 = <error: No registers.>\n'); return; } }
       else { var as = this.splitAssign(arg); v = as ? this.assign(as[0], as[1]) : this.evalExpr(arg); }
       if (v.nodebug) throw this.nodebugErr(v);
+      if (isCall && v.voidc) return;
       var txt = this.fmtVal(v, fmt);
       if (quiet) { this.out(txt); return; }
       var n = this.record(v);
@@ -2087,7 +2205,11 @@
     try { var v = this.evalExpr(d.expr); if (v.nodebug) throw this.nodebugErr(v); this.out(d.num + ': ' + (d.fmt ? '/' + d.fmt + ' ' : '') + d.expr + ' = ' + this.fmtVal(v, d.fmt) + '\n'); }
     catch (e) { if (!e.gdb) throw e; }
   };
-  GDB.prototype.showDisplays = function () { if (!this.running) return; for (var i = 0; i < this.displays.length; i++) this.showOne(this.displays[i]); };
+  GDB.prototype.showDisplays = function () {
+    if (!this.running) return;
+    this.inDisplay = true;
+    try { for (var i = 0; i < this.displays.length; i++) this.showOne(this.displays[i]); } finally { this.inDisplay = false; }
+  };
   GDB.prototype.cmdUndisplay = function (arg) {
     arg = (arg || '').trim();
     if (!arg) { if (!this.displays.length) return; this.ask('Delete all auto-display expressions? (y or n) ', 'yn', function (yes) { if (yes) this.displays = []; }); return; }
@@ -2481,7 +2603,7 @@
       case 'kill': return this.cmdKill();
       case 'print': return this.cmdPrint(arg);
       case 'output': this.cmdPrint(arg, true); return;
-      case 'call': if (/\(/.test(arg)) { this.out('[simulator: calling functions inside the program is not supported]\n'); return; } return this.cmdPrint(arg);
+      case 'call': return this.cmdPrint(arg, false, true);
       case 'printf': return this.cmdPrintf(arg);
       case 'echo': this.out(this.unescape(arg)); return;
       case 'x': return this.cmdX(arg);
@@ -2691,6 +2813,11 @@
     row("bt &nbsp;/&nbsp; up &nbsp;/&nbsp; down", "who called whom"),
     row("finish", "run to the end of this function"),
     '</div></details>',
+    '<details><summary>Let the bomb compute</summary><div class="rows">',
+    row("p (int)fun7(&amp;n1, 20)", "call a bomb function (while running)"),
+    row("p (int)string_length(\"abc\")", "strings work as arguments too"),
+    row("x/16dw &amp;'array.3434'", "a static table; copy the exact name from disas"),
+    '</div><div class="note">Without the cast, gdb answers <i>unknown return type</i>. Without the quotes, it reads <code>array.3434</code> as <code>array</code>. A breakpoint inside the called function stops it there; <code>finish</code> or <code>continue</code> then drops you back where you were.</div></details>',
     '<details><summary>Addresses: offsets vs. real</summary><div class="note">',
     'Before the first ' + c('run') + ', gdb shows <b>file offsets</b> like ' + c('0x2aac') + ' (the bomb is position-independent and not loaded yet), and ' + c('x/s 0x2aac') + ' reads the file. ',
     'After ' + c('run'), ' it switches to <b>real addresses</b> (here ' + c('0x555555400000') + ' + offset) and keeps them even after the bomb exits; the bare offset then fails. ',
@@ -2716,3 +2843,5 @@
   cmdEl.focus();
 })();
 </script>
+
+</body></html>
